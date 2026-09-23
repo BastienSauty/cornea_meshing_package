@@ -1,0 +1,13 @@
+[project]
+name = "cornea"
+version = "0.1.0"
+description = "Axisymmetric cornea section: conic geometry, square-to-cornea mapping, Gmsh export"
+requires-python = ">=3.9"
+dependencies = ["numpy", "scipy", "matplotlib", "meshio"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["cornea"]
