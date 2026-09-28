@@ -1,8 +1,9 @@
 # cornea
 
 Builds a 2D axisymmetric cornea section bounded by two conic surfaces, meshes it by
-mapping a structured square mesh onto it, exports a tagged Gmsh mesh, and recovers
-the Jacobian of the mapping to orient fields (fibres, normals) defined on the square.
+mapping a structured square mesh onto it, and exports a tagged Gmsh mesh that carries,
+per element, the local orientation frame (circumferential and through-thickness
+directions) of the mapping.
 
 ## Quick start
 
@@ -64,13 +65,15 @@ Outputs in `output/`:
 
 | File | Content |
 |---|---|
-| `cornea.msh` | Gmsh MSH 2.2 ASCII mesh: nodes, 4-node quads, tagged boundary lines, nodal fields `u`, `v` |
+| `cornea.msh` | Gmsh MSH 2.2 ASCII mesh: nodes, 4-node quads, tagged boundary lines, per-element local orientation frame (`circ`, `normal`, as 3-component vector element data) |
 | `cornea_mesh.png` | the mapped mesh |
-| `cornea_fields.png` | fibre and normal directions, computed from `cornea.msh` only |
+| `cornea_fields.png` | circ and normal directions, read straight back from `cornea.msh` |
 | `cornea_tags.png` | physical groups, read back from `cornea.msh` |
 
-The console also prints checks: the limbus edge is normal to the posterior face, the
-discrete Jacobian matches the exact one, and every element keeps a positive orientation.
+The console also prints checks: the limbus edge is normal to the posterior face, every
+element keeps a positive orientation, `circ` and `normal` are orthogonal and orientation-
+preserving, and the values read back from `cornea.msh` match the exact map to within text
+I/O precision (see [§3](#3-the-local-orientation-frame-circ-and-normal)).
 
 ### Physical groups in `cornea.msh`
 
@@ -87,12 +90,16 @@ Coordinates are written as `(x, z, 0)`: `x` is the radial direction, `z` the opt
 ### Using it from Python
 
 ```python
-from cornea import CorneaParams, CorneaGeometry, build_nodes, write_msh
+from cornea import CorneaParams, CorneaGeometry, build_nodes, element_frames, write_msh, read_msh, read_frames
 
 p = CorneaParams.from_json("params.json")      # or CorneaParams(R_v=5.0, ...)
 geom = CorneaGeometry(p)
-pts, uv = build_nodes(geom, p.Nx, p.Ny)        # (Ny, Nx, 2) arrays, pts = phi(uv)
-write_msh("cornea.msh", pts, uv)
+pts, uv = build_nodes(geom, p.Nx, p.Ny)         # (Ny, Nx, 2) arrays, pts = phi(uv)
+circ, normal = element_frames(geom, uv)         # (n_elem, 2) each, one pair per quad
+write_msh("cornea.msh", pts, circ, normal)
+
+mesh = read_msh("cornea.msh")                   # a plain meshio.Mesh
+centroids, circ, normal = read_frames(mesh)     # read straight back, no recomputation
 
 xz = geom.phi(0.5, 0.5)                         # exact map at any (u, v)
 F = geom.F_exact(0.5, 0.5)                      # its Jacobian
@@ -164,59 +171,123 @@ If your solver works with displacements instead, `geom.displacement(X, Y, L, H)`
 $\varphi(X/L, Y/H) - (X, Y)$ for nodes of a square $[0,L]\times[0,H]$; keep only the
 boundary nodes to use it as a Dirichlet condition.
 
-## 3. The Jacobian F and how to use it
+## 3. The local orientation frame: circ and normal
 
 ### Definition
+
+At any $(u, v)$, the Jacobian of the map is
 
 $$
 F = \frac{\partial (x, z)}{\partial (u, v)} =
 \begin{bmatrix} \partial x/\partial u & \partial x/\partial v \\ \partial z/\partial u & \partial z/\partial v \end{bmatrix}
 $$
 
-### Recovering F from the mesh file
-
-Every node stores its physical coordinates $(x, z)$ and, as nodal fields, its reference
-coordinates $(u, v)$, with $(x, z) = \varphi(u, v)$. No analytic $\varphi$ is needed: inside
-each element both are interpolated with the same bilinear shape functions
-$N_a(\xi, \eta)$, so
-
-$$
-J_x = \sum_a (x_a, z_a) \otimes \nabla_\xi N_a, \qquad
-J_u = \sum_a (u_a, v_a) \otimes \nabla_\xi N_a, \qquad
-F = J_x\, J_u^{-1}
-$$
-
-This is `element_jacobians()` (evaluated at element centres). It works for any mesh that
-carries the `u`, `v` fields. The run compares it with the exact $F$ of $\varphi$ (relative
-error about 2e-5 with the default mesh).
-
-**Inside an FE solver** it is even simpler: load `u` and `v` as FE functions and take their
-gradients. $G = [\nabla u;\ \nabla v] = F^{-1}$, so $F = G^{-1}$ and $F^{-T} = G^{T}$.
-
-### Transformation rules
+and the two directions actually needed downstream are its push-forwards of the square's
+own axes:
 
 | Quantity defined on the square | On the cornea | Function |
 |---|---|---|
-| scalar $s(u, v)$ (grading, damage...) | $s(u(x), v(x))$: just evaluate at the node's $(u, v)$ | |
-| material direction $A$ (fibre) | $a = F A / \lVert F A \rVert$ | `push_vector(F, A)` |
-| normal or gradient direction $N$ | $n = F^{-T} N / \lVert F^{-T} N \rVert$ | `push_normal(F, N)` |
-| gradient of a scalar | $\nabla_x s = F^{-T} \nabla_{uv} s$ | |
+| circumferential/radial direction $(1,0)$ | $\text{circ} = F\,(1,0) / \lVert F\,(1,0) \rVert$ | `push_vector(F, [1,0])` |
+| through-thickness direction $(0,1)$ | $\text{normal} = F^{-T}(0,1) / \lVert F^{-T}(0,1) \rVert$ | `push_normal(F, [0,1])` |
 
-Examples, as plotted in `cornea_fields.png`:
+- **circ**: tangent to the $v =$ const curves (including both faces) — the direction
+  along the radius/circumference;
+- **normal**: $\propto \nabla v$, exactly normal to the anterior and posterior faces,
+  pointing from posterior to anterior.
 
-- **fibre along the radius**: $F\,(1, 0)$, tangent to the $v = $ const curves (including
-  both faces);
-- **normal from posterior to anterior**: $F^{-T}(0, 1) \propto \nabla v$, exactly normal
-  to the anterior and posterior faces.
-
-These two are orthogonal everywhere by construction ($F^T F^{-T} = I$), a useful check.
+These two are orthogonal everywhere by construction ($F^T F^{-T} = I$), which is one of
+the checks the run prints.
 
 **Pitfall:** the mapped $v$-grid lines $F\,(0, 1)$ are *not* normal to the faces (up to
-about 3° off here), because the Coons map is not orthogonal. Use $F^{-T}$ for anything
-that must be normal to the surfaces.
+about 3° off here), because the Coons map is not orthogonal — that's why `normal` uses
+$F^{-T}$, not $F$.
 
 **Axisymmetric note:** the circumferential direction $e_\theta$ is not affected by the 2D
-map; for a fibre with radial and hoop components, map only the in-plane part with $F$.
+map; for a fibre with radial and hoop components, map only the in-plane part with `circ`.
+
+### Computing circ and normal
+
+`element_frames(geom, uv)` evaluates the exact $F$ (`geom.F_exact`, by central
+differences of $\varphi$) at each quad's centroid $(u, v)$ and pushes it forward directly
+— there is no bilinear recovery step and no dependence on any nodal field. It returns two
+`(n_elem, 2)` arrays, `circ` and `normal`, one pair per quad, in the same element order
+`write_msh` builds the quads in (`i` fast, `j` slow).
+
+### Storage: circ and normal as 3-component vector element data
+
+`cornea.msh` carries `circ` and `normal` as **element data** (one value per quad, not per
+node): two vector Gmsh fields, `circ` and `normal`, each with 3 components
+$(\text{v}_x, \text{v}_z, 0)$ — the in-plane components as computed, the out-of-plane
+component fixed at 0.
+
+Gmsh's `$ElementData`/`$NodeData` post-processing blocks only support 1, 3 or 9
+components per field (scalar, vector, tensor) — this is a hard rule of the file format
+itself, not a meshio restriction, so a literal 2-component vector isn't a legal Gmsh data
+block. Padding to 3 components with a dummy 0 is the standard way to carry a 2D vector in
+Gmsh — exactly how the node coordinates in this same file are always written `(x, z, 0)`
+even though the geometry is 2D. It also means the file is read back the same way whether
+`circ`/`normal` are genuinely 2D or 3D, with no special-casing needed downstream, and it
+lets Gmsh's own viewer recognise and draw them as vectors (arrows) rather than as
+unrelated scalar colour maps.
+
+This replaces the old nodal `u`, `v` fields and the Jacobian-recovery step that used to
+read them back (`element_jacobians()` no longer exists) — the mesh now carries the
+orientation frame directly, and reading it back is just slicing off the dummy third
+component of two vectors instead of four numbers reassembled into two.
+
+`write_msh` and `read_msh` in `mesh_io.py` are written out explicitly rather than calling
+`meshio.write` / `meshio.read`, because the installed meshio can have two independent bugs
+that break that round trip on a mesh that mixes cell types the way this one always does
+(tagged boundary `line` elements plus interior `quad` elements):
+
+1. **Write side (numpy $\geq 2$ dependent).** meshio's ASCII writer formats each value with
+   `repr()`; with numpy $\geq 2$, `repr(np.float64(0.0))` is the string `"np.float64(0.0)"`
+   instead of `"0.0"`, corrupting the file it writes.
+2. **Read side (independent of numpy).** meshio's Gmsh 2.2 reader reconstructs
+   `cell_data` by splitting one flat, file-order array back into per-cell-type blocks
+   using `len(c)` on a `(type, array)` tuple — always 2 — instead of each block's actual
+   element count, so any mesh with more than one cell type gets split at the wrong point.
+   Confirmed correct in meshio 5.0.0, confirmed broken in 5.3.5 (the latest at time of
+   writing): a version regression, not a one-off fluke.
+
+Both bugs are independent of the number of components per field — switching `circ1`,
+`circ2`, `normal1`, `normal2` (four scalar fields) to `circ`, `normal` (two 3-component
+vector fields) was tested against `meshio.write`/`meshio.read` directly and reproduces
+both failures identically, so the round trip still has to be handled by hand.
+
+`write_msh` writes plain, explicitly-formatted floats (`f"{v:.12g}"`, never `repr()`), so
+bug 1 never arises regardless of the installed numpy. `read_msh` parses
+`$Nodes`/`$Elements`/`$PhysicalNames`/`$ElementData` itself, computes the correct
+per-cell-block split from the actual element counts, and only then builds
+`meshio.Mesh(points, cells, cell_data=..., field_data=...)` — so bug 2's buggy split
+function is never called. The object `read_msh` returns is a completely ordinary
+`meshio.Mesh` (`.points`, `.cells`, `.cell_data`, `.cell_data_dict`, `.get_cells_type`,
+`.field_data`, ...), so `plot_mesh`, `plot_fields` and `plot_tags` need no adaptation.
+
+### Assembly for later use
+
+`read_frames(mesh)` in `jacobian.py` is the read-side counterpart of `element_frames`:
+
+```python
+centroids, circ, normal = read_frames(mesh)
+```
+
+It takes the element centroids from `mesh.points`/`mesh.get_cells_type("quad")`, and
+slices the in-plane part straight off the two vector fields:
+
+$$
+\text{circ} = \text{mesh.cell\_data\_dict["circ"]["quad"][:, :2]}, \qquad
+\text{normal} = \text{mesh.cell\_data\_dict["normal"]["quad"][:, :2]}
+$$
+
+(dropping the dummy out-of-plane third component). No Jacobian, no bilinear shape
+functions, no matrix inversion — the mesh already carries the final vectors.
+`diagnostics(circ, normal, F_ref=None)` then checks that `circ` and `normal` are unit and
+orthogonal and that orientation is preserved (`circ x normal > 0` everywhere); passing
+`geom.F_exact` at the same points as `F_ref` additionally reports the angular error
+against the exact map, which at this point only measures the mesh's text I/O round-trip
+precision (circ/normal were written from that same exact map in the first place),
+typically a few $\times 10^{-5}$ degrees with `.12g` formatting.
 
 ## Package layout
 
@@ -224,8 +295,9 @@ map; for a fibre with radial and hoop components, map only the in-plane part wit
 cornea/
   params.py     CorneaParams: inputs, JSON read/write
   geometry.py   conics, limbus edge, Coons map phi, exact F
-  mesh_io.py    structured nodes, Gmsh MSH 2.2 writer (tags + u, v fields)
-  jacobian.py   F from a meshio mesh, push_vector / push_normal, checks
+  mesh_io.py    structured nodes, element_frames (circ/normal from the exact map),
+                write_msh / read_msh (tags + circ/normal as 3-component vector element data)
+  jacobian.py   push_vector / push_normal, read_frames (assembles circ/normal), diagnostics
   plots.py      plot_mesh, plot_fields, plot_tags
   __main__.py   command line: python -m cornea params.json -o output
 params.json
